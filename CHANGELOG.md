@@ -39,6 +39,12 @@ Bottom level categories:
 
 ## Unreleased 
 
+### Changes
+
+#### General
+
+- `wgpu::Error` is now `Sync`, making it possible to be wrapped in `anyhow::Error` or `eyre::Report`. By @nolanderc in [#5820](https://github.com/gfx-rs/wgpu/pull/5820)
+
 ## v0.20.1 (2024-06-12)
 
 This release included v0.21.0 of `wgpu-core` and `wgpu-hal`, due to breaking changes needed to solve vulkan validation issues.
