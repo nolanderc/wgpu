@@ -1893,6 +1893,32 @@ bitflags::bitflags! {
     }
 }
 
+/// Order in which TextureData is laid out in memory.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
+pub enum TextureDataOrder {
+    /// The texture is laid out densely in memory as:
+    ///
+    /// ```text
+    /// Layer0Mip0 Layer0Mip1 Layer0Mip2
+    /// Layer1Mip0 Layer1Mip1 Layer1Mip2
+    /// Layer2Mip0 Layer2Mip1 Layer2Mip2
+    /// ````
+    ///
+    /// This is the layout used by dds files.
+    #[default]
+    LayerMajor,
+    /// The texture is laid out densely in memory as:
+    ///
+    /// ```text
+    /// Layer0Mip0 Layer1Mip0 Layer2Mip0
+    /// Layer0Mip1 Layer1Mip1 Layer2Mip1
+    /// Layer0Mip2 Layer1Mip2 Layer2Mip2
+    /// ```
+    ///
+    /// This is the layout used by ktx and ktx2 files.
+    MipMajor,
+}
+
 /// Dimensions of a particular texture view.
 ///
 /// Corresponds to [WebGPU `GPUTextureViewDimension`](
@@ -2341,8 +2367,14 @@ bitflags::bitflags! {
         /// to a render pass for an automatic driver-implemented resolve.
         const MULTISAMPLE_RESOLVE = 1 << 5;
         /// When used as a STORAGE texture, then a texture with this format can be bound with
-        /// [`StorageTextureAccess::ReadOnly`] or [`StorageTextureAccess::ReadWrite`].
-        const STORAGE_WRITE = 1 << 6;
+        /// [`StorageTextureAccess::ReadOnly`].
+        const STORAGE_READ_ONLY = 1 << 8;
+        /// When used as a STORAGE texture, then a texture with this format can be bound with
+        /// [`StorageTextureAccess::WriteOnly`].
+        const STORAGE_WRITE_ONLY = 1 << 6;
+        /// When used as a STORAGE texture, then a texture with this format can be bound with
+        /// any [`StorageTextureAccess`].
+        const STORAGE_READ_WRITE = 1 << 9;
         /// If not present, the texture can't be blended into the render target.
         const BLENDABLE = 1 << 7;
     }
@@ -3379,10 +3411,13 @@ impl TextureFormat {
         } else {
             basic
         };
-        let bgra8unorm = if device_features.contains(Features::BGRA8UNORM_STORAGE) {
-            attachment | TextureUsages::STORAGE_BINDING
+        let (bgra8unorm_f, bgra8unorm) = if device_features.contains(Features::BGRA8UNORM_STORAGE) {
+            (
+                msaa_resolve | TextureFormatFeatureFlags::STORAGE_WRITE_ONLY,
+                attachment | TextureUsages::STORAGE_BINDING,
+            )
         } else {
-            attachment
+            (msaa_resolve, attachment)
         };
 
         #[rustfmt::skip] // lets make a nice table
@@ -3412,7 +3447,7 @@ impl TextureFormat {
             Self::Rgba8Snorm =>           (        noaa,    storage),
             Self::Rgba8Uint =>            (        msaa,  all_flags),
             Self::Rgba8Sint =>            (        msaa,  all_flags),
-            Self::Bgra8Unorm =>           (msaa_resolve, bgra8unorm),
+            Self::Bgra8Unorm =>           (bgra8unorm_f, bgra8unorm),
             Self::Bgra8UnormSrgb =>       (msaa_resolve, attachment),
             Self::Rgb10a2Uint =>          (        msaa, attachment),
             Self::Rgb10a2Unorm =>         (msaa_resolve, attachment),
@@ -5553,7 +5588,7 @@ impl Default for SurfaceCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SurfaceConfiguration<V> {
-    /// The usage of the swap chain. The only supported usage is `RENDER_ATTACHMENT`.
+    /// The usage of the swap chain. The only usage guaranteed to be supported is `RENDER_ATTACHMENT`.
     pub usage: TextureUsages,
     /// The texture format of the swap chain. The only formats that are guaranteed are
     /// `Bgra8Unorm` and `Bgra8UnormSrgb`
@@ -6041,6 +6076,38 @@ fn test_max_mips() {
     );
 }
 
+/// Describes a `TextureView`.
+///
+/// For use with `Texture::create_view`.
+///
+/// Corresponds to [WebGPU `GPUTextureViewDescriptor`](
+/// https://gpuweb.github.io/gpuweb/#dictdef-gputextureviewdescriptor).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextureViewDescriptor<L> {
+    /// Debug label of the texture view. This will show up in graphics debuggers for easy identification.
+    pub label: L,
+    /// Format of the texture view. Either must be the same as the texture format or in the list
+    /// of `view_formats` in the texture's descriptor.
+    pub format: Option<TextureFormat>,
+    /// The dimension of the texture view. For 1D textures, this must be `D1`. For 2D textures it must be one of
+    /// `D2`, `D2Array`, `Cube`, and `CubeArray`. For 3D textures it must be `D3`
+    pub dimension: Option<TextureViewDimension>,
+    /// Aspect of the texture. Color textures must be [`TextureAspect::All`].
+    pub aspect: TextureAspect,
+    /// Base mip level.
+    pub base_mip_level: u32,
+    /// Mip level count.
+    /// If `Some(count)`, `base_mip_level + count` must be less or equal to underlying texture mip count.
+    /// If `None`, considered to include the rest of the mipmap levels, but at least 1 in total.
+    pub mip_level_count: Option<u32>,
+    /// Base array layer.
+    pub base_array_layer: u32,
+    /// Layer count.
+    /// If `Some(count)`, `base_array_layer + count` must be less or equal to the underlying array count.
+    /// If `None`, considered to include the rest of the array layers, but at least 1 in total.
+    pub array_layer_count: Option<u32>,
+}
+
 /// Describes a [`Texture`](../wgpu/struct.Texture.html).
 ///
 /// Corresponds to [WebGPU `GPUTextureDescriptor`](
@@ -6173,6 +6240,60 @@ impl<L, V> TextureDescriptor<L, V> {
         match self.dimension {
             TextureDimension::D1 | TextureDimension::D3 => 1,
             TextureDimension::D2 => self.size.depth_or_array_layers,
+        }
+    }
+}
+
+/// Describes a `Sampler`.
+///
+/// For use with `Device::create_sampler`.
+///
+/// Corresponds to [WebGPU `GPUSamplerDescriptor`](
+/// https://gpuweb.github.io/gpuweb/#dictdef-gpusamplerdescriptor).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SamplerDescriptor<L> {
+    /// Debug label of the sampler. This will show up in graphics debuggers for easy identification.
+    pub label: L,
+    /// How to deal with out of bounds accesses in the u (i.e. x) direction
+    pub address_mode_u: AddressMode,
+    /// How to deal with out of bounds accesses in the v (i.e. y) direction
+    pub address_mode_v: AddressMode,
+    /// How to deal with out of bounds accesses in the w (i.e. z) direction
+    pub address_mode_w: AddressMode,
+    /// How to filter the texture when it needs to be magnified (made larger)
+    pub mag_filter: FilterMode,
+    /// How to filter the texture when it needs to be minified (made smaller)
+    pub min_filter: FilterMode,
+    /// How to filter between mip map levels
+    pub mipmap_filter: FilterMode,
+    /// Minimum level of detail (i.e. mip level) to use
+    pub lod_min_clamp: f32,
+    /// Maximum level of detail (i.e. mip level) to use
+    pub lod_max_clamp: f32,
+    /// If this is enabled, this is a comparison sampler using the given comparison function.
+    pub compare: Option<CompareFunction>,
+    /// Must be at least 1. If this is not 1, all filter modes must be linear.
+    pub anisotropy_clamp: u16,
+    /// Border color to use when address_mode is [`AddressMode::ClampToBorder`]
+    pub border_color: Option<SamplerBorderColor>,
+}
+
+impl<L: Default> Default for SamplerDescriptor<L> {
+    fn default() -> Self {
+        Self {
+            label: Default::default(),
+            address_mode_u: Default::default(),
+            address_mode_v: Default::default(),
+            address_mode_w: Default::default(),
+            mag_filter: Default::default(),
+            min_filter: Default::default(),
+            mipmap_filter: Default::default(),
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 32.0,
+            compare: None,
+            anisotropy_clamp: 1,
+            border_color: None,
         }
     }
 }
